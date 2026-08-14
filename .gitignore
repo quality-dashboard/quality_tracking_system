@@ -1,0 +1,17 @@
+# 虚拟环境（几百MB，不能上传）
+venv/
+
+# Python 缓存文件
+__pycache__/
+*.pyc
+*.pyo
+
+# 本地数据库文件（迁移到Turso后不再需要）
+*.db
+
+# 敏感配置（token在这，绝对不能上传）
+.streamlit/secrets.toml
+
+# IDE 临时文件
+.vscode/
+.idea/

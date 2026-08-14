@@ -1,0 +1,20 @@
+# .streamlit/config.toml
+# 舍弗勒银川工厂 - 型号质量跟踪与预警系统 主题配置
+
+[theme]
+primaryColor = "#1a1a2e"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f0f2f6"
+textColor = "#1a1a2e"
+font = "sans serif"
+
+[server]
+maxUploadSize = 50
+headless = true
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
+showSidebarNavigation = false

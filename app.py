@@ -49,6 +49,7 @@ from spc_chart import (
     render_trend_chart,
     render_pareto_chart,
     render_model_pass_rate_chart,
+    render_model_fail_rate_chart,
     render_defect_analysis_chart,
     render_top5_alert_chart,
     render_monthly_trend_chart,
@@ -389,7 +390,7 @@ def render_data_entry():
 
     defect_inputs = {}
     dcols = st.columns(3)
-    for i in range(6):
+    for i in range(len(DEFECT_TYPE_FIELDS)):
         field_name = DEFECT_TYPE_FIELDS[i]
         label = DEFECT_LABELS[field_name]
         col_idx = i % 3
@@ -687,13 +688,13 @@ def render_analysis_report():
     st.markdown("---")
 
     # ============================================================
-    # 第二行: 图1(型号合格率) | 图2(缺陷不良分析)
+    # 第二行: 图1(型号不合格率问题看板) | 图2(缺陷不良分析)
     # ============================================================
-    st.markdown("### 📈 型号合格率 & 缺陷不良分析")
+    st.markdown("### 📈 型号不合格率 & 缺陷不良分析")
     col_left, col_right = st.columns(2)
 
     with col_left:
-        fig1, insight1 = render_model_pass_rate_chart(df_rpt, CHART_COLORS)
+        fig1, insight1 = render_model_fail_rate_chart(df_rpt, CHART_COLORS)
         st.plotly_chart(fig1, use_container_width=True, config=_PLOTLY_CONFIG)
         _render_insight(insight1)
 
@@ -763,7 +764,8 @@ def render_analysis_report():
         trend_models = ["全部"] + sorted(df["型号"].dropna().unique().tolist())
         trend_model_sel = st.selectbox("型号选择", trend_models, key="mt_model")
     with mc3:
-        trend_defects = ["全部", "锻造缺陷", "磕伤/卡伤", "接刀痕", "过车/欠车", "油沟", "倒角", "漏黑"]
+        trend_defects = ["全部", "锻造缺陷", "磕伤/卡伤", "接刀痕", "过车/欠车", "油沟", "倒角", "漏黑",
+                         "椭圆超差", "内径垫伤", "滚道对称点过大", "对称度超差", "幅高椭圆"]
         trend_defect_sel = st.selectbox("缺陷类型选择", trend_defects, key="mt_defect")
 
     # ★ 图4用完整df + 独立months参数 (不依赖顶部日期筛选)
@@ -792,12 +794,13 @@ def render_analysis_report():
     # ★ 任务B4: 展示层回填 - 从报废原因/返修原因文本提取缺陷数据
     df_display = _backfill_defects_for_display(df_rpt)
 
-    # ★ 任务B3: 列名与数据录入页对齐 (使用带斜杠的显示名 + 漏黑列)
+    # ★ 任务B3: 列名与数据录入页对齐 (使用带斜杠的显示名 + 漏黑列 + 5个新缺陷字段)
     display_cols = [
         "日期", "班次", "型号", "产品类型", "订单号", "车削操作者",
         "工序", "检测数量", "合格数量", "返修数量", "报废数量",
         "报废率", "返修率", "总不合格率",
         "锻造缺陷", "磕伤/卡伤", "接刀痕", "过车/欠车", "油沟", "倒角", "漏黑",
+        "椭圆超差", "内径垫伤", "滚道对称点过大", "对称度超差", "幅高椭圆",
         "报废原因", "返修原因",
     ]
 

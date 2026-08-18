@@ -26,16 +26,19 @@ BASE_COLUMNS = [
 ]
 
 # 注意: 数据库列名不带斜杠, 避免 Turso SQL 解析器报 400
-DEFECT_COLUMNS = ["锻造缺陷", "磕伤卡伤", "接刀痕", "过车欠车", "油沟", "倒角", "漏黑"]
+# 7个原字段 + 5个新增字段(椭圆超差/内径垫伤/滚道对称点过大/对称度超差/幅高椭圆)
+DEFECT_COLUMNS = ["锻造缺陷", "磕伤卡伤", "接刀痕", "过车欠车", "油沟", "倒角", "漏黑",
+                  "椭圆超差", "内径垫伤", "滚道对称点过大", "对称度超差", "幅高椭圆"]
 
 ALL_COLUMNS = BASE_COLUMNS + DEFECT_COLUMNS
 
-# 界面显示名 <-> 数据库列名 的映射
+# 界面显示名 <-> 数据库列名 的映射 (新5字段无斜杠, 显示名=数据库名, 无需映射)
 _DISPLAY_TO_DB = {"磕伤/卡伤": "磕伤卡伤", "过车/欠车": "过车欠车"}
 _DB_TO_DISPLAY = {"磕伤卡伤": "磕伤/卡伤", "过车欠车": "过车/欠车"}
 
-# 界面显示名 (load_all_records 返回的列名, 带斜杠)
-DEFECT_FIELDS_DISPLAY = ["锻造缺陷", "磕伤/卡伤", "接刀痕", "过车/欠车", "油沟", "倒角", "漏黑"]
+# 界面显示名 (load_all_records 返回的列名, 带斜杠的带斜杠, 新5字段不带斜杠)
+DEFECT_FIELDS_DISPLAY = ["锻造缺陷", "磕伤/卡伤", "接刀痕", "过车/欠车", "油沟", "倒角", "漏黑",
+                         "椭圆超差", "内径垫伤", "滚道对称点过大", "对称度超差", "幅高椭圆"]
 
 
 class _Result:
@@ -150,6 +153,21 @@ def init_db():
         )
     """.format(cols_sql)
     _execute(create_sql)
+    # 幂等补充缺失的缺陷列 (兼容已有数据库: 新增字段时自动ALTER TABLE)
+    _ensure_defect_columns()
+
+
+def _ensure_defect_columns():
+    """检查DEFECT_COLUMNS里的列是否都存在, 缺失的ALTER TABLE补充"""
+    for col in DEFECT_COLUMNS:
+        try:
+            _execute('SELECT "{}" FROM quality_records LIMIT 1'.format(col))
+        except Exception:
+            try:
+                _execute('ALTER TABLE quality_records ADD COLUMN "{}" TEXT DEFAULT ""'.format(col))
+                print("[表结构] 新增列: {}".format(col))
+            except Exception as e:
+                print("[表结构] ALTER TABLE失败 {}: {}".format(col, e))
 
 
 def save_record(record):

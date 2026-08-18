@@ -21,8 +21,10 @@ except Exception:
         "neutral": "#7f7f7f",
     }
 
-# 界面显示的6个缺陷字段名 (与 load_all_records 返回的列名一致, 带斜杠)
-DEFECT_FIELDS_DISPLAY = ["锻造缺陷", "磕伤/卡伤", "接刀痕", "过车/欠车", "油沟", "倒角", "漏黑"]
+# 界面显示的缺陷字段名 (与 load_all_records 返回的列名一致, 带斜杠的带斜杠)
+# 7个原字段 + 5个新增字段(椭圆超差/内径垫伤/滚道对称点过大/对称度超差/幅高椭圆)
+DEFECT_FIELDS_DISPLAY = ["锻造缺陷", "磕伤/卡伤", "接刀痕", "过车/欠车", "油沟", "倒角", "漏黑",
+                         "椭圆超差", "内径垫伤", "滚道对称点过大", "对称度超差", "幅高椭圆"]
 
 
 def render_trend_chart(
@@ -237,6 +239,88 @@ def render_model_pass_rate_chart(df, colors=None):
     return fig, insight
 
 
+def render_model_fail_rate_chart(df, colors=None):
+    """
+    图1(改造版): 型号不合格率问题看板 (柱状图+折线图)
+    - 只展示不合格率 > 5% 的型号 (聚焦问题型号)
+    - 柱状图(左Y): 不合格数量 = 报废数量 + 返修数量
+    - 折线图(右Y): 不合格率 (%)
+    - 横轴: 按不合格率从高到低排序 (最严重的在左)
+    - 空值保持为空, 检测数量为0的型号不合格率置0(会被>5%筛掉)
+    返回 (Figure, 解读文字)
+    """
+    if colors is None:
+        colors = CHART_COLORS
+    title = "型号不合格率问题看板（不合格率>5%）"
+    if df.empty:
+        return _empty_fig(title), "暂无数据"
+
+    grouped = df.groupby("型号").agg(
+        检测数量=("检测数量", "sum"),
+        报废数量=("报废数量", "sum"),
+        返修数量=("返修数量", "sum"),
+    ).reset_index()
+
+    # 不合格数量 = 报废 + 返修; 不合格率 = 不合格数量 / 检测数量 × 100
+    grouped["不合格数量"] = grouped["报废数量"] + grouped["返修数量"]
+    grouped["不合格率"] = grouped.apply(
+        lambda r: round(r["不合格数量"] / r["检测数量"] * 100, 2) if r["检测数量"] and r["检测数量"] > 0 else 0.0,
+        axis=1,
+    )
+
+    # 只保留不合格率 > 5% 的型号
+    problem = grouped[grouped["不合格率"] > 5.0].copy()
+    if problem.empty:
+        msg = "当前时间范围内无不合格率超过5%的型号"
+        return _empty_fig(title, msg), msg
+
+    # 按不合格率从高到低 (问题最严重的在左)
+    problem = problem.sort_values("不合格率", ascending=False).reset_index(drop=True)
+
+    # 悬停数据: [检测数量, 不合格数量, 不合格率] (柱/折线统一, 鼠标放哪都看全)
+    hover_data = problem[["检测数量", "不合格数量", "不合格率"]].values.tolist()
+    hover_tpl = "<b>%{x}</b>｜检测数量：%{customdata[0]:.0f}｜不合格数量：%{customdata[1]:.0f}｜不合格率：%{customdata[2]:.1f}%<extra></extra>"
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=problem["型号"],
+        y=problem["不合格数量"],
+        name="不合格数量",
+        marker_color=colors["danger"],
+        text=problem["不合格数量"].astype(str),
+        textposition="outside",
+        customdata=hover_data,
+        hovertemplate=hover_tpl,
+    ))
+    fig.add_trace(go.Scatter(
+        x=problem["型号"],
+        y=problem["不合格率"],
+        mode="lines+markers+text",
+        name="不合格率(%)",
+        yaxis="y2",
+        line=dict(color=colors["warning"], width=2),
+        text=["{:.1f}%".format(v) for v in problem["不合格率"]],
+        textposition="top center",
+        customdata=hover_data,
+        hovertemplate=hover_tpl,
+    ))
+    fig.update_layout(
+        title=title,
+        xaxis_title="型号",
+        yaxis=dict(title="不合格数量", side="left", rangemode="tozero"),
+        yaxis2=dict(title="不合格率 (%)", side="right", overlaying="y", rangemode="tozero"),
+        height=400,
+        margin=dict(l=50, r=50, t=50, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+
+    # 解读: 不合格率最高的1-2个型号
+    top_n = problem.head(2)
+    tips = ["{}({:.1f}%)".format(r["型号"], r["不合格率"]) for _, r in top_n.iterrows()]
+    insight = "💡 不合格率最高的型号: {}，建议优先排查该型号工序能力与物料稳定性。".format("、".join(tips))
+    return fig, insight
+
+
 def render_defect_analysis_chart(df, colors=None):
     """
     图2: 缺陷类型不良分析组合图 (柱状图+折线图)
@@ -364,6 +448,10 @@ def render_top5_alert_chart(df, days, threshold, colors=None):
             main_defects.append("-")
     grouped["主要缺陷"] = main_defects
 
+    # 悬停数据: [检测数量, 报废数量, 报废率] (柱/折线统一, 与图1同款交互)
+    hover_data = grouped[["检测数量", "报废数量", "报废率"]].values.tolist()
+    hover_tpl = "<b>%{x}</b>｜检测数量：%{customdata[0]:.0f}｜报废数量：%{customdata[1]:.0f}｜报废率：%{customdata[2]:.1f}%<extra></extra>"
+
     # ★ 图表: 柱状图(报废数量) + 折线图(报废率), 与图1风格一致
     fig = go.Figure()
     fig.add_trace(go.Bar(
@@ -373,6 +461,8 @@ def render_top5_alert_chart(df, days, threshold, colors=None):
         marker_color=colors["primary"],
         text=grouped["报废数量"].astype(str),
         textposition="outside",
+        customdata=hover_data,
+        hovertemplate=hover_tpl,
     ))
     fig.add_trace(go.Scatter(
         x=grouped["型号"],
@@ -383,6 +473,8 @@ def render_top5_alert_chart(df, days, threshold, colors=None):
         line=dict(color=colors["danger"], width=2),
         text=["{:.1f}%".format(v) for v in grouped["报废率"]],
         textposition="top center",
+        customdata=hover_data,
+        hovertemplate=hover_tpl,
     ))
     fig.update_layout(
         title="近{}天不良Top5预警看板 (阈值≥{}件)".format(days, threshold),
@@ -438,7 +530,7 @@ def render_monthly_trend_chart(df, model, defect_type, months=6, colors=None):
     fig = go.Figure()
 
     if defect_type == "全部":
-        # ★ 固定显示6种缺陷类型, 全部画线, 数据为0也显示 (修复: 不再隐藏后3条)
+        # ★ 固定显示全部缺陷类型(7原+5新=12种), 全部画线, 数据为0也显示
         # 每种缺陷类型固定一个颜色, 顺序与DEFECT_FIELDS_DISPLAY一致
         field_colors = {
             "锻造缺陷": "#9467bd",   # 紫
@@ -448,6 +540,12 @@ def render_monthly_trend_chart(df, model, defect_type, months=6, colors=None):
             "油沟": "#2ca02c",       # 绿
             "倒角": "#8c564b",       # 棕
             "漏黑": "#2c2c2c",       # 深灰/黑
+            # ★ v4 新增5个缺陷类型颜色
+            "椭圆超差": "#17becf",       # 青
+            "内径垫伤": "#e377c2",       # 粉红
+            "滚道对称点过大": "#393b79",  # 深蓝紫
+            "对称度超差": "#637ed6",     # 蓝紫
+            "幅高椭圆": "#8c6d31",       # 橄榄棕
         }
 
         for field in DEFECT_FIELDS_DISPLAY:

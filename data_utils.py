@@ -127,8 +127,21 @@ def _execute(sql, args=None):
     return _parse_result(result)
 
 
+# ★ v3.9: init_db进程内只执行一次的标记
+# app.py顶层每次rerun都会调用init_db(), 而它每次要跑13次Turso网络往返
+# (1次CREATE TABLE + 12次缺陷列检查SELECT), 是录入页每次交互都变灰的元凶
+_DB_INIT_DONE = False
+
+
 def init_db():
-    """初始化数据库表结构"""
+    """初始化数据库表结构
+    ★ v3.9: 进程内只真正执行一次(建表+补列是幂等操作, 无需每次rerun都跑)
+    - 模块热重载(改代码)时Streamlit会重新导入本模块, 标记自动复位, 仍会执行一次
+    - 首次执行失败(如网络断)时标记不置位, 下次rerun自动重试
+    """
+    global _DB_INIT_DONE
+    if _DB_INIT_DONE:
+        return
     cols_sql = ",\n".join(['"{}" TEXT DEFAULT ""'.format(c) for c in DEFECT_COLUMNS])
     create_sql = """
         CREATE TABLE IF NOT EXISTS quality_records (
@@ -155,6 +168,7 @@ def init_db():
     _execute(create_sql)
     # 幂等补充缺失的缺陷列 (兼容已有数据库: 新增字段时自动ALTER TABLE)
     _ensure_defect_columns()
+    _DB_INIT_DONE = True  # ★ 成功后才置位(失败下次rerun重试)
 
 
 def _ensure_defect_columns():
@@ -184,6 +198,7 @@ def save_record(record):
         sql = "INSERT INTO quality_records ({}) VALUES ({})".format(col_names, placeholders)
 
         _execute(sql, values)
+        _clear_records_cache()  # ★ 写操作后清缓存, 确保下次读取拿到最新数据
         return True
     except Exception as e:
         print("save_record error:", e)
@@ -201,23 +216,85 @@ def save_records_batch(records):
     return count
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_all_records_cached():
+    """
+    ★ 性能优化: 真实查询Turso的缓存层 (只缓存成功结果, 查询失败抛异常不会被缓存)
+    - v3.9 ttl从300秒放宽到3600秒: 全量数据只给分析报告/月报用, 报告类页面
+      接受最长1小时滞后(与分析报告页自动刷新周期对齐); 写操作仍会主动清缓存,
+      确保下次打开报告页时拉到最新数据
+    """
+    result = _execute("SELECT * FROM quality_records ORDER BY id DESC")
+    df = pd.DataFrame(result.rows, columns=result.columns)
+    df = df.rename(columns=_DB_TO_DISPLAY)
+    # ★ 防御: 历史动态缺陷功能残留的 additional_defects 列不返回前端(数据库字段保留, 仅界面不显示)
+    df = df.drop(columns=["additional_defects"], errors="ignore")
+    return df
+
+
 def load_all_records():
-    """加载全部记录为DataFrame, 自动把数据库列名转回界面显示名"""
+    """加载全部记录为DataFrame(带缓存), 自动把数据库列名转回界面显示名; 失败返回空表"""
     try:
-        result = _execute("SELECT * FROM quality_records ORDER BY id DESC")
-        df = pd.DataFrame(result.rows, columns=result.columns)
-        df = df.rename(columns=_DB_TO_DISPLAY)
-        return df
+        return _load_all_records_cached()
     except Exception as e:
         print("load_all_records error:", e)
         return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_recent_records_cached(limit=50):
+    """
+    ★ v3.9 新增: 录入页专用的轻量查询 (最近N条 + 总记录数)
+    - 只拉最近limit条记录 + 一条COUNT查询, 网络载荷恒定, 不随数据量增长变慢
+    - 与 _load_all_records_cached 分开缓存: 录入页刷新不会牵连报告页的全量缓存
+    - 写操作后由 _clear_records_cache() 一并清空, 提交后表格立即显示新记录
+    返回 (最近N条DataFrame, 总记录数int)
+    """
+    result = _execute("SELECT * FROM quality_records ORDER BY id DESC LIMIT ?", [limit])
+    df = pd.DataFrame(result.rows, columns=result.columns)
+    df = df.rename(columns=_DB_TO_DISPLAY)
+    df = df.drop(columns=["additional_defects"], errors="ignore")
+    # 总记录数单独COUNT(不拉全表); Turso的integer经_from_turso_value已转int
+    cnt = _execute("SELECT COUNT(*) FROM quality_records")
+    total = int(cnt.rows[0][0]) if cnt.rows else 0
+    return df, total
+
+
+def load_recent_records(limit=50):
+    """加载最近N条记录(轻量, 录入页表格用); 失败返回 (空表, 0)"""
+    try:
+        return _load_recent_records_cached(limit)
+    except Exception as e:
+        print("load_recent_records error:", e)
+        return pd.DataFrame(), 0
+
+
+def _clear_records_cache():
+    """清空记录读取缓存(内部用): 增/删记录后调用, 确保下次读取拿到最新数据
+    ★ v3.9: 同时清"全量缓存"和"最近N条缓存"(录入表格提交后立即显示新记录)"""
+    try:
+        _load_all_records_cached.clear()
+    except Exception:
+        pass
+    try:
+        _load_recent_records_cached.clear()
+    except Exception:
+        pass
+
+
+def clear_records_cache():
+    """对外接口: 手动刷新按钮用, 强制下次从数据库拉最新数据"""
+    _clear_records_cache()
 
 
 def delete_record(record_id):
     """删除指定ID的记录"""
     try:
         result = _execute("DELETE FROM quality_records WHERE id = ?", [record_id])
-        return result.affected_row_count > 0
+        ok = result.affected_row_count > 0
+        if ok:
+            _clear_records_cache()  # ★ 删除成功后清缓存
+        return ok
     except Exception as e:
         print("delete_record error:", e)
         return False
@@ -249,8 +326,10 @@ def evaluate_warning(scrap_rate, consecutive_days):
     return None
 
 
+@st.cache_data(show_spinner=False)
 def get_alerts_from_data(df):
-    """从DataFrame中提取活跃预警列表"""
+    """从DataFrame中提取活跃预警列表
+    ★ v3.9 加缓存: 按df内容哈希缓存(侧边栏/分析报告/月报共用同一份数据时只算一次)"""
     alerts = []
     if df.empty:
         return alerts
@@ -302,11 +381,13 @@ DEFECT_TYPE_FIELDS = DEFECT_COLUMNS
 # ============================================================
 
 
+@st.cache_data(show_spinner=False)
 def aggregate_model_pass_rate(df):
     """
     按型号聚合合格率
     返回 DataFrame: [型号, 检测数量, 合格数量, 报废数量, 合格率]
     合格率 = 合格数量 / 检测数量 * 100, 按合格率从高到低排列
+    ★ v3.9 加缓存: 月报两次调用(图表+明细)只算一次; 数据变化时缓存自动失效
     """
     if df.empty:
         return pd.DataFrame(columns=["型号", "检测数量", "合格数量", "报废数量", "合格率"])
@@ -322,6 +403,7 @@ def aggregate_model_pass_rate(df):
     return grouped.sort_values("合格率", ascending=False).reset_index(drop=True)
 
 
+@st.cache_data(show_spinner=False)
 def aggregate_defect_summary(df):
     """
     按6个缺陷字段聚合不良数据
@@ -329,6 +411,7 @@ def aggregate_defect_summary(df):
     - 不良数量: 该缺陷字段非空时, 对应记录的报废数量之和
     - 涉及型号数: 该缺陷出现的不同型号数量
     - 发生次数: 该缺陷字段非空的记录条数
+    ★ v3.9 加缓存: 月报总结里调用, 数据变化时缓存自动失效
     """
     if df.empty:
         return pd.DataFrame(columns=["缺陷类型", "不良数量", "占比", "涉及型号数", "发生次数"])
@@ -481,33 +564,61 @@ def aggregate_monthly_trend(df, model, defect_type):
         return monthly.rename(columns={"报废数量": "不良数量"})
 
 
+def calculate_pass_rate_capped(pass_qty, rework_qty, scrap_qty, inspect_qty):
+    """
+    ★ v3.6 统一口径: 反推合格率, 保证 合格率+报废率+返修率 恒=100%
+    - 报废率/返修率用真实数(硬数据): 报废/检测, 返修/检测
+    - 合格率 = 100% - 报废率 - 返修率 (即"检测-报废-返修"反推)
+      → 自动吸收个别记录录入的±误差(如合格+返修+报废>检测), 三者之和不再超100%
+    - 极端脏数据(报废+返修>检测)时合格率压到0, 不出现负数
+    """
+    if inspect_qty <= 0:
+        return 0.0
+    scrap_rate = scrap_qty / inspect_qty * 100
+    rework_rate = rework_qty / inspect_qty * 100
+    pass_rate = 100.0 - scrap_rate - rework_rate
+    if pass_rate < 0:
+        pass_rate = 0.0
+    return round(pass_rate, 2)
+
+
+@st.cache_data(show_spinner=False)
 def get_monthly_overview(df, year_month):
     """
     月度概览KPI
     - year_month: "YYYY-MM" 格式
-    返回 dict: {总检验数, 合格率, 报废率, 预警次数}
+    返回 dict: {总检验数, 合格率, 报废率, 返修率, 预警次数, ...}
+    ★ v3.6: 合格率改为反推口径(100-报废率-返修率), 确保三者恒=100%
+      诊断结论: 个别记录录入时 合格+返修+报废>检测 导致原口径超标, 非统计逻辑问题
+    ★ v3.9 加缓存: 月报当月+环比上月各调一次, 同数据只算一次
     """
+    _empty = {"总检验数": 0, "合格率": 0.0, "报废率": 0.0, "返修率": 0.0, "预警次数": 0}
     if df.empty:
-        return {"总检验数": 0, "合格率": 0.0, "报废率": 0.0, "预警次数": 0}
+        return _empty
     df = df.copy()
     df["日期_dt"] = pd.to_datetime(df["日期"], errors="coerce")
     df["月份"] = df["日期_dt"].dt.strftime("%Y-%m")
     month_df = df[df["月份"] == year_month]
     if month_df.empty:
-        return {"总检验数": 0, "合格率": 0.0, "报废率": 0.0, "预警次数": 0}
+        return _empty
     total_inspect = int(month_df["检测数量"].sum())
     total_pass = int(month_df["合格数量"].sum())
     total_scrap = int(month_df["报废数量"].sum())
-    pass_rate = round(total_pass / total_inspect * 100, 2) if total_inspect > 0 else 0.0
+    total_rework = int(month_df["返修数量"].sum())
+    # ★ v3.6: 报废率/返修率用真实数, 合格率反推(三者恒=100%)
     scrap_rate = round(total_scrap / total_inspect * 100, 2) if total_inspect > 0 else 0.0
+    rework_rate = round(total_rework / total_inspect * 100, 2) if total_inspect > 0 else 0.0
+    pass_rate = calculate_pass_rate_capped(total_pass, total_rework, total_scrap, total_inspect)
     alerts = get_alerts_from_data(month_df)
     return {
         "总检验数": total_inspect,
         "合格率": pass_rate,
         "报废率": scrap_rate,
+        "返修率": rework_rate,
         "预警次数": len(alerts),
         "总合格数": total_pass,
         "总报废数": total_scrap,
+        "总返修数": total_rework,
     }
 
 

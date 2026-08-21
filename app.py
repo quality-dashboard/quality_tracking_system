@@ -1,16 +1,21 @@
 """
-app.py - 车间质量检测跟踪系统（主程序）v3.3
+app.py - 车间质量检测跟踪系统（主程序）v3.5
 舍弗勒银川工厂
-功能：数据录入（含Excel上传）、实时监控、分级预警、分析报告、月报
+功能：数据录入（含Excel上传）、分析报告、月报
 存储：Turso云数据库持久化
 变更：
-  v3.2 → v3.3: 新增分析报告KPI+4图表布局, 新增月报模块(4Tab)
-  v3.3.1: 图3改为柱+折线组合(报废数量+报废率), 图4改为月份聚合连续折线+独立时间范围
-  保留全部原有业务逻辑, 仅增量新增展示层
+  v3.4: 弱化实时监控(删页面入口), 新增问题型号缺陷堆叠总览图, 月报加返修率/报废率趋势
+  v3.5: 性能优化(load_all_records+图表函数加@st.cache_data缓存, 写操作后清缓存),
+        KPI加返修率, 删柏拉图(与图2重复), 图4改Top5不良率缺陷, 堆叠图图例移下方防重叠
+  v3.6: KPI合格率改反推口径(100-报废率-返修率), 配合数据修正保证三者恒=100%
+  v3.7: 堆叠图默认时间范围改为"今年1月1日至今"(独立筛选), 图4下方新增超标缺陷类型汇总图
+  v3.8: 全部图表统一"缺陷字段值口径"(图2/图4/堆叠图/图3主要缺陷), 同一缺陷数量处处一致
+  v3.9: 录入页性能优化 — init_db进程内只跑一次(每次rerun省13次Turso网络往返),
+        侧边栏统计改1小时缓存, 录入表格改轻量LIMIT查询, 聚合函数加缓存, 新增手动刷新报告按钮
 """
 import streamlit as st
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from export_to_template import fill_template
 from data_utils import delete_record
 from config import SCRAP_COUNT_WARNING, SCRAP_COUNT_CRITICAL
@@ -31,6 +36,8 @@ from data_utils import (
     save_record,
     save_records_batch,
     load_all_records,
+    load_recent_records,
+    clear_records_cache,
     calculate_scrap_rate,
     calculate_rework_rate,
     calculate_total_defect_rate,
@@ -46,14 +53,13 @@ from data_utils import (
     get_monthly_pass_rate_trend,
 )
 from spc_chart import (
-    render_trend_chart,
-    render_pareto_chart,
-    render_model_pass_rate_chart,
     render_model_fail_rate_chart,
     render_defect_analysis_chart,
     render_top5_alert_chart,
     render_monthly_trend_chart,
-    render_monthly_pass_rate_trend_chart,
+    render_defect_stack_chart,
+    render_overlimit_defect_chart,
+    render_monthly_scrap_rate_trend_chart,
 )
 
 _PLOTLY_CONFIG = {"displayModeBar": False}
@@ -113,7 +119,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-def inject_auto_refresh(interval_sec: int = 120):
+def inject_auto_refresh(interval_sec: int = 3600):
+    """页面自动刷新(秒) — 默认1小时, 适配早会/周会场景, 弱化实时监控"""
     st.markdown(
         '<meta http-equiv="refresh" content="{}">'.format(interval_sec),
         unsafe_allow_html=True,
@@ -143,6 +150,23 @@ def _fmt_pct(val, digits=2):
         return "{:.{}f}%".format(num, digits)
     except (ValueError, TypeError):
         return "-"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _get_sidebar_stats():
+    """★ v3.9 侧边栏统计(预警数/记录数/型号数/工序数) — 每小时最多重算一次
+    - 之前每次rerun(员工在录入框每敲一下键盘)都全量拉数据+重算预警, 是录入页卡顿主因之一
+    - 写操作(录入/删除/导入)不清此缓存: 员工录入不等统计刷新, 最长滞后1小时
+    - 需要立即刷新时点侧边栏"手动刷新报告数据"按钮
+    """
+    df = load_all_records()
+    alerts = get_alerts_from_data(df)
+    return {
+        "alert_count": len(alerts),
+        "record_count": int(len(df)),
+        "model_count": int(df["型号"].nunique()) if not df.empty else 0,
+        "process_count": int(df["工序"].nunique()) if not df.empty else 0,
+    }
 
 
 # 6个标准缺陷字段 (带斜杠, 与load_all_records返回一致)
@@ -483,13 +507,17 @@ def render_data_entry():
     if st.button("🔄 加载/刷新数据", use_container_width=True, key="btn_load"):
         if "pending_delete_id" in st.session_state:
             del st.session_state["pending_delete_id"]
+        clear_records_cache()       # ★ 清数据缓存后再刷新, 从数据库拉最新数据
+        _get_sidebar_stats.clear()  # ★ v3.9 顺带刷新侧边栏统计(用户主动点刷新, 允许重新拉取)
         st.rerun()
 
-    df_current = load_all_records()
+    # ★ v3.9: 录入页表格改用轻量查询(只拉最近50条+总数), 不再加载全量数据
+    # 提交/删除后此缓存被清空, 表格立即显示最新记录; 网络载荷恒定, 数据再多也不变慢
+    df_current, total_records = load_recent_records(50)
     if df_current.empty:
         st.info("暂无数据。")
     else:
-        display_df = df_current.head(50).copy().reset_index(drop=True)
+        display_df = df_current.copy().reset_index(drop=True)
         display_df.insert(0, "序号", range(1, len(display_df) + 1))
 
         # ★ 百分比列格式化为带%字符串 (只改展示, 不影响导出)
@@ -497,8 +525,9 @@ def render_data_entry():
             if _col in display_df.columns:
                 display_df[_col] = display_df[_col].apply(lambda x: _fmt_pct(x))
 
-        st.caption("共 {} 条记录（显示最近50条）".format(len(df_current)))
-        show_cols = [c for c in display_df.columns if c != "id"]
+        st.caption("共 {} 条记录（显示最近50条）".format(total_records))
+        # ★ 隐藏 id 和 additional_defects(历史动态缺陷残留列, 数据库保留但前端不显示)
+        show_cols = [c for c in display_df.columns if c not in ("id", "additional_defects")]
         st.dataframe(display_df[show_cols], use_container_width=True, hide_index=True)
 
         st.markdown("---")
@@ -544,94 +573,19 @@ def render_data_entry():
                     st.rerun()
 
 
-def render_dashboard():
-     inject_auto_refresh(120)
-
-     st.header("📊 实时监控看板")
-     df = load_all_records()
-     if not df.empty:
-         latest_date = str(df["日期"].max())
-         st.caption("⏱️ 本页面每2分钟自动刷新 | 数据最新日期：{}".format(latest_date))
-     else:
-         st.caption("⏱️ 本页面每2分钟自动刷新")
-     render_alert_banner(df)
-     st.markdown("---")
-
-     if df.empty:
-        st.info("暂无数据，请先在【数据录入】中录入检测记录。")
-        return
-
-     st.subheader("📈 报废率趋势")
-     available_models = sorted(df["型号"].dropna().unique().tolist())
-     available_processes = sorted(df["工序"].dropna().unique().tolist())
-
-     if not available_models:
-        st.info("暂无型号数据。")
-        return
-
-     tcol1, tcol2 = st.columns(2)
-     with tcol1:
-        trend_model = st.selectbox("选择型号", available_models, key="dash_model")
-     with tcol2:
-        trend_process = st.selectbox(
-            "选择工序（可选）", ["全部"] + available_processes, key="dash_proc"
-        )
-
-     proc_filter = None if trend_process == "全部" else trend_process
-     fig = render_trend_chart(df, trend_model, proc_filter)
-     st.plotly_chart(fig, use_container_width=True)
-
-
-def render_warning_center():
-    st.header("🚨 分级预警中心")
-
-    with st.expander("📋 预警规则说明", expanded=False):
-        st.markdown("""
-
-        | 等级 | 触发条件 | 颜色 | 处置要求 |
-        |------|----------|------|----------|
-        | 重点关注 | 当日报废 **≥ {}** 件 | 🟡 黄色 | 加强巡检频次，排查原因 |
-        | 批次不良 | 当日报废 **≥ {}** 件 | 🔴 红色 | 判定为小批次报废，立即停线排查 |
-        """.format(SCRAP_COUNT_WARNING, SCRAP_COUNT_CRITICAL))
-
-    df = load_all_records()
-    alerts = get_alerts_from_data(df)
-
-    if not alerts:
-        st.success("✅ 当前无活跃预警。")
-        return
-
-    st.subheader("⚠️ 活跃预警（{} 项）".format(len(alerts)))
-    for idx, alert in enumerate(alerts):
-        with st.container():
-            ac1, ac2, ac3 = st.columns([2, 1, 4])
-            with ac1:
-                st.markdown("**{}**".format(alert["型号"]))
-                st.caption("工序: {}".format(alert["工序"]))
-            with ac2:
-                if alert["等级"] == "批次不良":
-                    color = "#dc3545"
-                else:
-                    color = "#f0ad4e"
-                label = "{} 件".format(alert["当日报废件数"])
-                st.markdown(
-                    '<span style="color:{};font-size:22px;font-weight:bold;">'
-                    '{}</span>'.format(color, label),
-                    unsafe_allow_html=True,
-                )
-            with ac3:
-                if alert["等级"] == "批次不良":
-                    st.error("📌 {}".format(alert["原因"]))
-                else:
-                    st.warning("📌 {}".format(alert["原因"]))
-            st.markdown("---")
+# ============================================================
+# ★ v3.4: "实时监控"和"分级预警"独立页面已删除(弱化实时监控)
+# - 分级预警的判定逻辑(get_alerts_from_data/evaluate_warning)完整保留
+# - 月报"预警回顾"Tab仍调用这些底层函数
+# - render_alert_banner预警横幅组件保留(底层组件, 不再被页面调用)
+# ============================================================
 
 
 def render_analysis_report():
-    inject_auto_refresh(120)
+    inject_auto_refresh(3600)
 
     st.header("🔍 分析报告")
-    st.caption("⏱️ 本页面每2分钟自动刷新")
+    st.caption("⏱️ 本页面每1小时自动刷新 | 服务早会/周会质量回顾")
 
     df = load_all_records()
     if df.empty:
@@ -639,9 +593,11 @@ def render_analysis_report():
         return
 
     # ---------- 时间筛选 + 型号筛选 ----------
+    # ★ v3.4: 默认时间范围 = 今天往前一个月, 进入页面即显示, 无需手动选日期
+    default_start = datetime.now() - timedelta(days=30)
     fcol1, fcol2, fcol3 = st.columns(3)
     with fcol1:
-        start_date = st.date_input("开始日期", value=datetime(2026, 1, 1), key="rpt_start")
+        start_date = st.date_input("开始日期", value=default_start, key="rpt_start")
     with fcol2:
         end_date = st.date_input("结束日期", value=datetime.now(), key="rpt_end")
     with fcol3:
@@ -662,29 +618,68 @@ def render_analysis_report():
         st.warning("所选条件下无数据。")
         return
 
-    sel_model = None if report_model == "全部" else report_model
-
     # ============================================================
-    # KPI卡片行 (4个)
+    # KPI卡片行 (5个)
     # ============================================================
     total_inspect = int(df_rpt["检测数量"].sum())
     total_pass = int(df_rpt["合格数量"].sum())
     total_scrap = int(df_rpt["报废数量"].sum())
-    pass_rate = round(total_pass / total_inspect * 100, 1) if total_inspect > 0 else 0.0
+    total_rework = int(df_rpt["返修数量"].sum())
+    # ★ v3.6 统一口径: 报废率/返修率用真实数, 合格率反推(100-报废-返修), 三者恒=100%
+    #   诊断结论: 个别记录录入时 合格+返修+报废>检测, 若直接用 合格/检测 会超100%
     scrap_rate = round(total_scrap / total_inspect * 100, 1) if total_inspect > 0 else 0.0
+    rework_rate = round(total_rework / total_inspect * 100, 1) if total_inspect > 0 else 0.0
+    pass_rate = round(max(100.0 - scrap_rate - rework_rate, 0.0), 1)
     alert_count = len(get_alerts_from_data(df_rpt))
 
     pass_color = CHART_COLORS["success"] if pass_rate >= 95 else (CHART_COLORS["warning"] if pass_rate >= 90 else CHART_COLORS["danger"])
     scrap_color = CHART_COLORS["success"] if scrap_rate < 2 else (CHART_COLORS["warning"] if scrap_rate < 5 else CHART_COLORS["danger"])
+    rework_color = CHART_COLORS["success"] if rework_rate < 3 else (CHART_COLORS["warning"] if rework_rate < 5 else CHART_COLORS["danger"])
     alert_color = CHART_COLORS["success"] if alert_count == 0 else (CHART_COLORS["warning"] if alert_count < 3 else CHART_COLORS["danger"])
 
     st.markdown("### 📊 质量概览")
+    # ★ v3.5: 新增返修率KPI; v3.6 合格率改为反推口径, 与月报一致
     _render_kpi_row([
         ("总检测数", "{}件".format(total_inspect), CHART_COLORS["primary"]),
         ("合格率", "{:.1f}%".format(pass_rate), pass_color),
         ("报废率", "{:.1f}%".format(scrap_rate), scrap_color),
+        ("返修率", "{:.1f}%".format(rework_rate), rework_color),
         ("预警数", "{}个".format(alert_count), alert_color),
     ])
+    st.caption("💡 口径: 报废率=报废/检测, 返修率=返修/检测, 合格率=100%-报废率-返修率（三者恒=100%）")
+    st.markdown("---")
+
+    # ============================================================
+    # ★ v3.4 第一张图: 问题型号缺陷堆叠总览图 (放图1之前, 早会投屏第一眼)
+    # 只显示不良率>5%的型号, 柱内按缺陷类型堆叠, 直观回答"哪些型号有问题、问题多大、什么缺陷导致"
+    # ★ v3.7: 默认时间范围从"今天往前一个月"改为"今年1月1日至今"(年初至今YTD)
+    #   独立时间筛选, 不随顶部开始/结束日期联动; 其他图表和筛选条件保持原样
+    # ============================================================
+    st.markdown("### 🏆 问题型号缺陷堆叠总览图")
+    st.caption("独立时间范围，默认今年1月1日至今（其他图表仍跟随顶部筛选）")
+
+    scol1, scol2 = st.columns(2)
+    with scol1:
+        # 开始日期默认 = 当年1月1日 (如2026年即2026-01-01)
+        stack_start = st.date_input(
+            "开始日期", value=datetime(datetime.now().year, 1, 1), key="stack_start")
+    with scol2:
+        # 结束日期默认 = 今天
+        stack_end = st.date_input("结束日期", value=datetime.now(), key="stack_end")
+
+    # 用独立日期范围切数据(基于完整df, 不受顶部日期/型号筛选影响)
+    df_stack = df.copy()
+    df_stack["日期_dt"] = pd.to_datetime(df_stack["日期"], errors="coerce")
+    stack_mask = (
+        (df_stack["日期_dt"] >= pd.Timestamp(stack_start))
+        & (df_stack["日期_dt"] <= pd.Timestamp(stack_end))
+    )
+    df_stack = df_stack[stack_mask]
+
+    fig_stack, insight_stack = render_defect_stack_chart(df_stack, CHART_COLORS)
+    st.plotly_chart(fig_stack, use_container_width=True, config=_PLOTLY_CONFIG)
+    _render_insight(insight_stack)
+
     st.markdown("---")
 
     # ============================================================
@@ -771,20 +766,29 @@ def render_analysis_report():
     # ★ 图4用完整df + 独立months参数 (不依赖顶部日期筛选)
     fig4, insight4 = render_monthly_trend_chart(df, trend_model_sel, trend_defect_sel, trend_months, CHART_COLORS)
     if trend_defect_sel == "全部":
-        st.caption("💡 点击图例可显示/隐藏缺陷类型（默认显示前3种最严重的，其余点击图例即可展开）")
+        st.caption("💡 纵轴为不良率(%)，自动显示近{}个月整体不良率最高的Top5缺陷类型；点击图例可显示/隐藏缺陷".format(trend_months))
     st.plotly_chart(fig4, use_container_width=True, config=_PLOTLY_CONFIG)
     _render_insight(insight4)
 
     st.markdown("---")
 
     # ============================================================
-    # 保留原有: 柏拉图
+    # ★ v3.7 新增: 超标缺陷类型汇总图（不良率>1%）— 放在图4下方
+    # 时间范围跟随顶部"开始日期/结束日期"(即df_rpt), 不与图4的型号/缺陷类型筛选器联动
+    # 柱状图=不良数量(报废+返修, 左轴), 折线图=不良率%(右轴)
     # ============================================================
-    st.subheader("📊 缺陷类型柏拉图")
-    fig_pareto = render_pareto_chart(df_rpt, sel_model)
-    st.plotly_chart(fig_pareto, use_container_width=True)
+    st.markdown("### ⚠️ 超标缺陷类型汇总")
+    st.caption("时间范围跟随顶部开始/结束日期；不良率=(报废+返修)÷检测×100%，只统计不良率>1%的缺陷类型")
+    fig_over, insight_over = render_overlimit_defect_chart(df_rpt, CHART_COLORS)
+    st.plotly_chart(fig_over, use_container_width=True, config=_PLOTLY_CONFIG)
+    _render_insight(insight_over)
 
     st.markdown("---")
+
+    # ============================================================
+    # ★ v3.5: 已删除"缺陷类型柏拉图"(与图2缺陷类型不良分析组合图功能重复)
+    # 分析报告保留6张图: 堆叠总览图 / 型号不合格率 / 缺陷不良分析 / Top5预警看板 / 月度趋势 / 超标缺陷汇总
+    # ============================================================
 
     # ============================================================
     # 保留原有: 总报告表格 (v3.3.2: 百分比格式化 + 列名对齐 + 展示层回填)
@@ -892,16 +896,21 @@ def render_monthly_report():
         st.subheader("当月KPI概览")
         pass_color = CHART_COLORS["success"] if overview["合格率"] >= 95 else (CHART_COLORS["warning"] if overview["合格率"] >= 90 else CHART_COLORS["danger"])
         scrap_color = CHART_COLORS["success"] if overview["报废率"] < 2 else (CHART_COLORS["warning"] if overview["报废率"] < 5 else CHART_COLORS["danger"])
+        rework_color = CHART_COLORS["success"] if overview["返修率"] < 3 else (CHART_COLORS["warning"] if overview["返修率"] < 5 else CHART_COLORS["danger"])
+        # ★ v3.4: 新增返修率KPI; v3.6 合格率改为反推口径(100-报废率-返修率), 三者恒=100%
         _render_kpi_row([
             ("总检验数", "{}件".format(overview["总检验数"]), CHART_COLORS["primary"]),
             ("合格率", "{:.1f}%".format(overview["合格率"]), pass_color),
             ("报废率", "{:.1f}%".format(overview["报废率"]), scrap_color),
+            ("返修率", "{:.1f}%".format(overview["返修率"]), rework_color),
             ("预警次数", "{}次".format(overview["预警次数"]), CHART_COLORS["danger"] if overview["预警次数"] > 0 else CHART_COLORS["success"]),
         ])
+        st.caption("💡 口径: 报废率=报废/检测, 返修率=返修/检测, 合格率=100%-报废率-返修率（三者恒=100%）")
 
         st.markdown("---")
-        st.subheader("月度合格率趋势图")
-        fig_trend = render_monthly_pass_rate_trend_chart(df, CHART_COLORS)
+        # ★ v3.4: 月度合格率趋势图 → 月度报废率趋势图(单线, 纵轴自动适配避免曲线太平)
+        st.subheader("月度报废率趋势图")
+        fig_trend = render_monthly_scrap_rate_trend_chart(df, CHART_COLORS)
         st.plotly_chart(fig_trend, use_container_width=True, config=_PLOTLY_CONFIG)
 
         if prev_overview and prev_overview["总检验数"] > 0:
@@ -912,17 +921,29 @@ def render_monthly_report():
             st.info("📊 上月无数据，暂无法做环比分析")
 
     with tab2:
-        st.subheader("型号合格率分析")
+        # ★ v3.4: 各型号合格率分析 → 各型号不合格率分析(聚焦问题型号, 服务改善决策)
+        st.subheader("各型号不合格率分析")
         model_rate = aggregate_model_pass_rate(month_df)
         if model_rate.empty:
             st.info("当月无型号数据。")
         else:
-            fig_model, model_insight = render_model_pass_rate_chart(month_df, CHART_COLORS)
+            fig_model, model_insight = render_model_fail_rate_chart(month_df, CHART_COLORS)
             st.plotly_chart(fig_model, use_container_width=True, config=_PLOTLY_CONFIG)
             _render_insight(model_insight)
 
-            st.markdown("**型号不良明细表**")
-            st.dataframe(model_rate, use_container_width=True, hide_index=True)
+            # ★ 明细表改为不合格率视角: 不合格率=(返修+报废)/检测
+            detail = month_df.groupby("型号").agg(
+                检测数量=("检测数量", "sum"),
+                返修数量=("返修数量", "sum"),
+                报废数量=("报废数量", "sum"),
+            ).reset_index()
+            detail["不合格数"] = detail["返修数量"] + detail["报废数量"]
+            detail["不合格率(%)"] = detail.apply(
+                lambda r: round(r["不合格数"] / r["检测数量"] * 100, 2) if r["检测数量"] > 0 else 0.0,
+                axis=1)
+            detail = detail.sort_values("不合格率(%)", ascending=False)
+            st.markdown("**型号不合格率明细表（按严重程度降序）**")
+            st.dataframe(detail, use_container_width=True, hide_index=True)
 
     with tab3:
         st.subheader("缺陷柏拉图分析")
@@ -1010,33 +1031,42 @@ def render_sidebar():
 
         page = st.radio(
             "📌 功能导航",
-            ["📝 数据录入", "📊 实时监控", "🚨 分级预警", "🔍 分析报告", "📅 月报"],
+            # ★ v3.4: 删除"实时监控"和"分级预警"入口(弱化实时监控, 强化分析报告+月报)
+            ["📝 数据录入", "🔍 分析报告", "📅 月报"],
             key="nav_page",
         )
 
         st.markdown("---")
 
-        df = load_all_records()
-        alerts = get_alerts_from_data(df)
+        # ★ v3.9: 侧边栏统计改用缓存(每小时最多重算一次), 不再每次rerun都拉全量数据
+        stats = _get_sidebar_stats()
 
-        if alerts:
-            st.error("🚨 {} 个活跃预警".format(len(alerts)))
+        if stats["alert_count"]:
+            st.error("🚨 {} 个活跃预警".format(stats["alert_count"]))
         else:
             st.success("✅ 系统正常")
 
         st.markdown("---")
         st.markdown("**数据概览**")
-        st.caption("检测记录: {} 条".format(len(df)))
-        if not df.empty:
-            st.caption("覆盖型号: {} 个".format(df["型号"].nunique()))
-            st.caption("覆盖工序: {} 个".format(df["工序"].nunique()))
+        st.caption("检测记录: {} 条".format(stats["record_count"]))
+        if stats["record_count"]:
+            st.caption("覆盖型号: {} 个".format(stats["model_count"]))
+            st.caption("覆盖工序: {} 个".format(stats["process_count"]))
 
         st.markdown("---")
         st.markdown("**预警阈值**")
         st.caption("报废率 > {}% 且连续{}天".format(WARNING_THRESHOLD, CONSECUTIVE_DAYS))
 
         st.markdown("---")
-        st.caption("⏱️ 实时监控 / 分析报告：每2分钟自动刷新")
+        # ★ v3.9: 手动刷新按钮 — 经理需要最新报告数据时点击, 清空全部缓存并重新拉取
+        if st.button("🔄 手动刷新报告数据", use_container_width=True, key="btn_refresh_reports"):
+            _get_sidebar_stats.clear()  # 侧边栏统计缓存
+            clear_records_cache()       # 全量+最近N条数据缓存
+            st.rerun()
+        st.caption("报告数据最长缓存1小时，录入不受影响")
+
+        st.markdown("---")
+        st.caption("⏱️ 分析报告：每1小时自动刷新")
         st.caption("📝 数据录入：完全手动，不自动刷新")
         st.markdown("---")
         st.caption("{} | {}".format(SYSTEM_NAME, VERSION))
@@ -1056,10 +1086,6 @@ def main():
 
     if page == "📝 数据录入":
         render_data_entry()
-    elif page == "📊 实时监控":
-        render_dashboard()
-    elif page == "🚨 分级预警":
-        render_warning_center()
     elif page == "🔍 分析报告":
         render_analysis_report()
     elif page == "📅 月报":
